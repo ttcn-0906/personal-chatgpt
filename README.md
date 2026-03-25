@@ -37,7 +37,7 @@ GROQ_API_KEY=你的_GROQ_API_KEY
 
 建議使用虛擬環境進行安裝：
 ```
-pip install streamlit groq python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 4. 啟動程式
