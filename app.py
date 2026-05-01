@@ -2,6 +2,8 @@ import os
 import streamlit as st
 from groq import Groq
 from dotenv import load_dotenv
+import base64
+import datetime
 
 # 載入環境變數
 load_dotenv()
@@ -19,6 +21,22 @@ if "chat_sessions" not in st.session_state:
     st.session_state.chat_sessions = {"新對話": []}
 if "current_session" not in st.session_state:
     st.session_state.current_session = "新對話"
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "當使用者詢問現在時間、日期時，呼叫此函數獲取當前本地時間。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    }
+]
 
 # --- 功能函式：自動生成標題 ---
 def generate_title(api_key, first_msg):
@@ -33,6 +51,27 @@ def generate_title(api_key, first_msg):
         return title if title else first_msg[:10]
     except:
         return first_msg[:10]
+    
+def get_best_model(prompt, current_choice):
+    # 1. 如果有關鍵字，直接覆蓋原本的選項
+    prompt_lower = prompt.lower()
+    
+    if any(k in prompt_lower for k in ["搜尋", "查詢", "網路上找", "search"]):
+        return "groq/compound" # 適合搜尋
+        
+    if any(k in prompt_lower for k in ["圖片", "picture"]):
+        return "meta-llama/llama-4-scout-17b-16e-instruct"
+        
+    # 2. 如果沒偵測到特殊意圖，使用使用者在側邊欄選的模型
+    return current_choice
+
+def get_current_time():
+    now = datetime.datetime.now()
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+available_functions = {
+    "get_current_time": get_current_time,
+}
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -110,17 +149,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("參數設定")
-    model_option = st.selectbox("模型", ["groq/compound", "qwen/qwen3-32b", "llama-3.3-70b-versatile"])
+    model_option = st.selectbox("模型", ["groq/compound", "qwen/qwen3-32b", "llama-3.3-70b-versatile", "meta-llama/llama-4-scout-17b-16e-instruct"])
     # 側邊欄加入
     role_choice = st.selectbox("切換 AI 模式", ["一般助手", "程式碼專家", "學術論文助手", "中英翻譯官"])
     temp_value = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
 
 # 設定對應內容
 prompts = {
-    "一般助手": "你是一個親切的 AI 助手。",
-    "程式碼專家": "你是一位資深工程師，請用專業、精簡的風格回答，並注重程式碼的效能與安全性。",
-    "學術論文助手": "請以學術寫作風格回答，強調邏輯與證據。",
-    "中英翻譯官": "請將所有輸入內容翻譯成流暢的對應語言（中轉英或英轉中）。"
+    "一般助手": "你是一個親切的 AI 助手。如果呼叫工具，請根據工具回傳的數據準確回答使用者的問題。",
+    "程式碼專家": "你是一位資深工程師，請用專業、精簡的風格回答，並注重程式碼的效能與安全性。如果呼叫工具，請根據工具回傳的數據準確回答使用者的問題。",
+    "學術論文助手": "請以學術寫作風格回答，強調邏輯與證據。如果呼叫工具，請根據工具回傳的數據準確回答使用者的問題。",
+    "中英翻譯官": "請將所有輸入內容翻譯成流暢的對應語言（中轉英或英轉中）。如果呼叫工具，請根據工具回傳的數據準確回答使用者的問題。"
 }
 
 # --- 主畫面 ---
@@ -130,62 +169,153 @@ st.title(f" {current_session}")
 messages = st.session_state.chat_sessions[current_session]
 
 # 顯示歷史訊息
-for message in messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+chat_container = st.container()
+with chat_container:
+    for message in messages:
+        if message["role"] == "tool" or message['content'] == None: continue
+        with st.chat_message(message["role"]):
+            content = message["content"]
+            if isinstance(content, list):
+                # 如果是 list (多模態)，取出文字並顯示圖片
+                for item in content:
+                    if item["type"] == "text":
+                        st.markdown(item["text"])
+                    elif item["type"] == "image_url":
+                        st.image(item["image_url"]["url"], width=300)
+            else:
+                # 原本的純文字模式
+                st.markdown(content)
+
+with st.container():
+    uploaded_file = st.file_uploader(
+        "選擇圖片 (選填)", 
+        type=["jpg", "jpeg", "png"], 
+        key=f"image_uploader_{st.session_state.uploader_key}",
+        label_visibility="collapsed"
+    )
+    
+    # 原本的聊天輸入框
+    prompt = st.chat_input("輸入訊息...")
 
 # 處理輸入
-if prompt := st.chat_input("輸入訊息..."):
+if prompt:
     if not api_key:
-        st.error("請輸入 API Key！")
+        st.error("請輸入 API Key!")
     else:
-        messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        # 建立訊息內容結構
+        content_payload = [{"type": "text", "text": prompt}]
+        
+        if uploaded_file:
+            bytes_data = uploaded_file.getvalue()
+            b64_str = base64.b64encode(bytes_data).decode('utf-8')
+            image_url = f"data:{uploaded_file.type};base64,{b64_str}"
+            
+            content_payload.append({
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            })
+            st.session_state.uploader_key += 1
+
+        messages.append({"role": "user", "content": content_payload})
+
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+                if uploaded_file:
+                    st.image(image_url, width=300)
 
         client = Groq(api_key=api_key)
         
+        target_model = get_best_model(prompt, model_option)
+
         # 根據模型決定參數
         params = {
-            "model": model_option,
-            "messages": [{"role": "system", "content": prompts[role_choice]}] + [{"role": m["role"], "content": m["content"]} for m in messages],
+            "model": target_model,
+            "messages": [{"role": "system", "content": prompts[role_choice]}] + [m for m in messages],
             "temperature": temp_value,
             "top_p": 1.0,
             "stream": True,
         }
 
-        if model_option == "groq/compound":
-            params["max_completion_tokens"] = 1024
-            params["compound_custom"] = {"tools": {"enabled_tools": ["web_search", "code_interpreter", "visit_website"]}}
-        elif model_option == "qwen/qwen3-32b":
+        if target_model == "groq/compound":
             params["max_completion_tokens"] = 4096
-            params["top_p"] = 0.95
-        else: # llama
-            params["max_completion_tokens"] = 1024
+            params["compound_custom"] = {"tools": {"enabled_tools": ["web_search", "code_interpreter", "visit_website"]}}
+        elif target_model == "qwen/qwen3-32b":
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
+            params["max_completion_tokens"] = 4096
+        elif target_model == "llama-3.3-70b-versatile":
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
+            params["max_completion_tokens"] = 4096
+        else:
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
+            params["max_completion_tokens"] = 4096
 
-        with st.chat_message("assistant"):
-            resp_place = st.empty()
-            full_res = ""
-            try:
-                completion = client.chat.completions.create(**params)
-                for chunk in completion:
-                    content = chunk.choices[0].delta.content or ""
-                    full_res += content
-                    resp_place.markdown(full_res + "▌")
-                resp_place.markdown(full_res)
-                messages.append({"role": "assistant", "content": full_res})
-                
-                # 自動生成標題並更新 Session Name
-                if len(messages) == 2 and current_session.startswith("新對話"):
-                    new_title = generate_title(api_key, prompt)
-                    # 避免標題重複
-                    if new_title in st.session_state.chat_sessions:
-                        new_title += f"_{len(st.session_state.chat_sessions)}"
+        with chat_container:
+            with st.chat_message("assistant"):
+                resp_place = st.empty()
+                params_no_stream = params.copy()
+                params_no_stream["stream"] = False
+
+                try:
+                    response = client.chat.completions.create(**params_no_stream)
+                    msg = response.choices[0].message
                     
-                    st.session_state.chat_sessions[new_title] = st.session_state.chat_sessions.pop(current_session)
-                    st.session_state.current_session = new_title
+                    if msg.tool_calls:
+                        messages.append({
+                            "role": "assistant",
+                            "content": msg.content,
+                            "tool_calls": msg.tool_calls
+                        })
+                        # --- 執行工具邏輯 ---
+                        for tool_call in msg.tool_calls:
+                            func_name = tool_call.function.name
+                            func_to_call = available_functions[func_name]
+                            
+                            tool_output = func_to_call()
+                            
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": tool_output
+                            })
+                        
+                        params_no_stream = params.copy()
+                        params_no_stream["messages"] = [{"role": "system", "content": prompts[role_choice]}] + [m for m in messages]
+                        params_no_stream["tool_choice"] = "none"
+                        params_no_stream["stream"] = False
+
+                        response = client.chat.completions.create(**params_no_stream)
+                        msg = response.choices[0].message
+
+                        full_res = msg.content
+                        resp_place.markdown(full_res)
+                        messages.append({"role": "assistant", "content": full_res})
+
+                    else:
+                        # --- 沒有工具呼叫，直接處理原本的串流 ---
+                        full_res = msg.content
+                        resp_place.markdown(full_res)
+                        messages.append({"role": "assistant", "content": full_res})
+                    
+                    print(messages)
+
+                    # 自動生成標題並更新 Session Name
+                    if len(messages) >= 2 and current_session.startswith("新對話"):
+                        new_title = generate_title(api_key, prompt)
+                        # 避免標題重複
+                        if new_title in st.session_state.chat_sessions:
+                            new_title += f"_{len(st.session_state.chat_sessions)}"
+                        
+                        st.session_state.chat_sessions[new_title] = st.session_state.chat_sessions.pop(current_session)
+                        st.session_state.current_session = new_title
+                    else:
+                        st.session_state.chat_sessions[current_session] = messages
+                    
                     st.rerun()
-                else:
-                    st.session_state.chat_sessions[current_session] = messages
-            except Exception as e:
-                st.error(f"發生錯誤：{e}")
+                    
+                except Exception as e:
+                    st.error(f"發生錯誤：{e}")
+                    assert False
